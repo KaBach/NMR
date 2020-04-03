@@ -1,0 +1,257 @@
+---
+title: "RNA-Seq Analysis of NMR and MM cell lines"
+author: "Karsten Bach"
+date: '`r Sys.Date()`'
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    theme: journal
+    highlight: tango
+    code_folding: hide
+---
+***
+
+
+# Load Data
+## Count matrices
+- The two datasets are read in independently
+- STAR adds statistics such as unmapped, ambiguous reads etc. that I extract first
+```{r, message=FALSE}
+library(edgeR)
+library(viridis)
+library(cowplot)
+library(ggplot2)
+library(biomaRt)
+library(dplyr)
+library(pheatmap)
+theme_set(theme_cowplot())
+
+# Read in Counts
+# Mouse
+mm.counts <- read.csv("../data/counts/MM_CountMatrix.csv",row.names=1)
+pDat <- read.csv("../data/meta/SampleInfo.csv",stringsAsFactors=FALSE)
+
+# NMR
+nmr.counts <- read.csv("../data/counts/NMR_Counts.csv",row.names=1)
+
+# Move stats to PD
+identical(c(colnames(mm.counts),colnames(nmr.counts)),pDat$Sample)
+pDat$Unmapped <- c(t(mm.counts)[,1],t(nmr.counts)[,1])
+pDat$MultiMap <- c(t(mm.counts)[,2],t(nmr.counts)[,2])
+pDat$NoFeat <- c(t(mm.counts)[,3],t(nmr.counts)[,3])
+pDat$Ambiguous <- c(t(mm.counts)[,4],t(nmr.counts)[,4])
+mm.counts <- mm.counts[-c(1:4),]
+nmr.counts <- nmr.counts[-c(1:4),]
+pDat$TotalReads <- c(colSums(mm.counts),colSums(nmr.counts))
+```
+
+
+## Combining the NMR and MM data
+- For the NMR datadset I need to map the gene0 to entrezIDs because of the gff file
+- I use a published list of orthologs mapping roughly ~16k genes from mouse to nmr (**Hilton et al.**)
+- I then concatenate the two gene expression matrices and use the mouse gene symbols as identifiers
+```{r, message=FALSE}
+# Convert NMR to Entrez Gene
+# These files will be in the same order as they both derive from the same gtf, but will map them properly anyway
+rmgenes <- read.table("../data/meta/rm_genes.tsv") # These are 24 tRNAs and a few ribosomal RNAs that don't have entrez geneID mapping in the gtf file
+nmr.counts <- nmr.counts[!rownames(nmr.counts) %in% rmgenes$V1,]
+conv <- read.csv("../data/meta/gene_id_mapping_clean.csv",stringsAsFactors=FALSE,row.names=1) # Conv has more genes, some of them were not mapped to in star
+conv <- conv[rownames(nmr.counts),]
+rownames(nmr.counts) <- conv
+
+# Subset both datasets to orthologous genes
+orthologs <- read.csv("../data/meta/media-28.csv",stringsAsFactor=FALSE)
+colnames(orthologs)[1] <- "entrezgene"
+orthologs <- orthologs[!orthologs$entrezgene %in% setdiff(orthologs$entrezgene,rownames(nmr.counts)),] # They have about a 100 genes in the list that are not annotated
+orthologs <- orthologs[!orthologs$mouse.gene_id %in% setdiff(orthologs$mouse.gene_id,rownames(mm.counts)),] # They have about a 5 genes in the list that are not annotated
+# Add in the transgenes to the orthologs list
+nmr.genes <- orthologs$entrezgene
+mm.genes <- orthologs$mouse.gene_id
+# Subset to ortholog set
+nmr.counts <- nmr.counts[nmr.genes,]
+mm.counts <- mm.counts[mm.genes,]
+# Set same names
+rownames(nmr.counts) <- rownames(mm.counts)
+counts <- cbind(mm.counts,nmr.counts)
+
+# Add Gene Annotation
+# Using the orthologs df now
+orthologs$uniq <- scater::uniquifyFeatureNames(orthologs$mouse.gene_id, orthologs$mouse.symbol)
+rownames(counts)[rownames(counts) %in% orthologs$mouse.gene_id] <- orthologs$uniq
+
+# gene.data$uniq <- scater::uniquifyFeatureNames(gene.data[,1],gene.data[,2])
+# gene.data <- gene.data[rownames(counts)[-((nrow(counts)-5):nrow(counts))],]
+# rownames(counts) <- c(gene.data$uniq,rownames(counts)[(nrow(counts)-5):nrow(counts)])
+
+
+rownames(pDat) <- pDat$Sample
+stopifnot(identical(rownames(pDat), colnames(counts)))
+```
+
+# Sanity checks
+## QC stats
+- Here I'm just checking that there is no massive differences in any of the statistic for any particular sampel
+```{r, message=FALSE, fig.width=9}
+p0 <- ggplot(pDat, aes(x=Sample,y=Unmapped)) +
+    geom_bar(stat="identity") +
+    facet_wrap(~Species,scale="free_x")
+p1 <- ggplot(pDat, aes(x=Sample,y=MultiMap)) +
+    geom_bar(stat="identity") +
+    facet_wrap(~Species,scale="free_x")
+p2 <- ggplot(pDat, aes(x=Sample,y=Ambiguous)) +
+    geom_bar(stat="identity") +
+    facet_wrap(~Species,scale="free_x")
+p3 <- ggplot(pDat, aes(x=Sample,y=NoFeat)) +
+    geom_bar(stat="identity") +
+    facet_wrap(~Species,scale="free_x")
+p4 <- ggplot(pDat, aes(x=Sample,y=TotalReads)) +
+    geom_bar(stat="identity") +
+    facet_wrap(~Species,scale="free_x")
+plot_grid(p0,p1,p2,p3,p4)
+```
+
+```{r, message=FALSE}
+# Set up DGEList
+keep <- rowSums(counts)>0
+counts <- counts[keep,]
+y <- DGEList(counts=counts,samples=pDat)
+# Normalize
+y <- calcNormFactors(y)
+
+# Get Log-Cpm
+logcpm <- cpm(y,log=TRUE)
+```
+
+# Principal Component Analysis
+- PCA on normalized log transformed counts of all orthologs
+```{r, message=FALSE, fig.width=7}
+# Compute PCA without transgenes
+pcs <- prcomp(t(logcpm))
+logcpm.pc <- pcs$x
+vars <- apply(logcpm.pc,2,var)
+rel.vars <- round(vars/sum(vars)*100,1)
+
+pDat <- y$samples
+pDat$PC1 <- logcpm.pc[,1]
+pDat$PC2 <- logcpm.pc[,2]
+pDat$PC3 <- logcpm.pc[,3]
+
+out <- group_by(pDat, Species, Transformation, Source) %>%
+    summarize(mPC2=mean(PC2))
+write.csv(out,"pc2s.csv")
+
+pDat$Transformation <- factor(pDat$Transformation, levels=c("Untransformed","SV40LT","SV40LTRasHadi","SV40LTRasTian"))
+# Plot
+ggplot(pDat, aes(x=PC1, y=PC2, color=Transformation, size=Species, shape=Source)) +
+    geom_point() +
+    xlab(paste0("PC1(",rel.vars["PC1"],"%)")) +
+    ylab(paste0("PC2(",rel.vars["PC2"],"%)")) +
+    scale_color_manual(values=c("black","#4DBBD5FF","red","#3C5488FF")) +
+    coord_fixed(1) +
+    scale_size_manual(values=c(2.5,4))
+ggsave("PCA.svg")
+```
+
+# Loadings
+- We can now look at the loadings of PC2 to see what processes are involved in separating the cells along an axis of transformation
+```{r, message=FALSE, fig.width=7}
+ld.pc2 <- pcs$rotation[,2]
+# plot(ld.pc2[order(ld.pc2,decreasing=TRUE)],ylab="Loadings of PC2")
+# abline(h=0.02,col="red",lty="dashed")
+# abline(h=-0.02,col="red",lty="dashed")
+ld.pc2.ord <- ld.pc2[order(ld.pc2,decreasing=TRUE)]
+fp <- data.frame("Gene"=names(ld.pc2.ord),
+		 "Loading"=ld.pc2.ord)
+fp$Index <- c(1:nrow(fp))
+library(ggrepel)
+ggplot(fp, aes(x=Index, y=Loading)) +
+    geom_point(color="grey80") +
+    geom_point(data=fp[abs(fp$Loading)>0.02,],color="black") +
+    geom_text_repel(data=fp[c(1:10,(nrow(fp)-10):nrow(fp)),], aes(label=Gene)) +
+    geom_hline(yintercept=0.02,color="red",lty="dashed") +
+    geom_hline(yintercept=-0.02,color="red",lty="dashed") +
+    ylab("PC2 Loading")
+ggsave("Loadings.svg")
+```
+
+## GO - Analysis
+```{r, message=FALSE, fig.width=9}
+ps <- ld.pc2[ld.pc2 > 0.02]
+ps <- ps[order(ps,decreasing=TRUE)]
+neg <- ld.pc2[ld.pc2 < -0.02]
+neg <- neg[order(neg)]
+
+topLoads <- list("Positive Loading"=ps, "Negative Loading"=neg)# topGO
+univrs <- names(ld.pc2)
+out <- list()
+
+for (i in seq_along(topLoads)) {
+    gens <- names(topLoads[[i]])
+    subst <- names(topLoads)[[i]]
+    # Gene universe
+    alG <- factor(as.numeric(univrs %in% gens))
+    names(alG) <- univrs
+
+    # ---- GOanalysis ----
+
+    library(topGO)
+    #prepare Data for topGO
+    GO.data <- new("topGOdata", description="Lib GO",ontology="BP", allGenes=alG, 
+		   annot=annFUN.org, mapping="org.Mm.eg.db",
+		   nodeSize=20, ID="symbol")
+    result.classic <- runTest(GO.data, statistic="fisher")
+    res <- GenTable(GO.data, Fisher.classic=result.classic, orderBy="topgoFisher", topNodes=50, numChar=300)
+
+    res$Fisher.classic <- as.numeric(res$Fisher.classic)
+    res$Term <- factor(res$Term, levels=res$Term[order(res$Fisher.classic,decreasing=TRUE)])
+    out[[subst]] <- res[1:5,] %>%  # this only works because they are ordered by fisher classic
+			mutate(hitsPerc=Significant*100/length(gens)) %>% 
+			ggplot(aes(y=hitsPerc, 
+				   x=Term, 
+				   fill=Fisher.classic
+				   )) +
+			    geom_col() +
+			    expand_limits(x=0) +
+			    labs(y="Hits (%)", x="GO term", colour="p value", size="Count") +
+			    scale_fill_viridis(begin=1,end=0) +
+			    coord_flip()
+}
+out[[1]] %+% ggtitle(names(out)[1])
+ggsave("Positive.svg",width=12)
+out[[2]] %+% ggtitle(names(out)[2])
+ggsave("Negative.svg",width=12)
+```
+
+## GSEA 
+- Also did the GSEA but don't like it that much
+```{r, message=FALSE, fig.width=7}
+
+# ---- fgsea ----
+# for the fun of it
+library(fgsea)
+# and get entrez genes
+ensembl  <- useMart("ensembl",dataset="mmusculus_gene_ensembl",host="useast.ensembl.org") # at the time of writing the ensembl.org had issues
+gene.data <- getBM(attributes=c('ensembl_gene_id','entrezgene_id'), mart=ensembl)
+gene.data <- gene.data[gene.data$ensembl_gene_id %in% orthologs$mouse.gene_id,]
+gene.data <- gene.data[!(is.na(gene.data$entrezgene_id)),]
+gene.data <- gene.data[!(duplicated(gene.data$ensembl_gene_id)),]
+gene.data$entrezgene_id <- as.character(gene.data$entrezgene_id)
+colnames(gene.data) <- c("mouse.gene_id","mouse.entrezgene")
+orthologs <- left_join(orthologs,gene.data)
+rownames(orthologs) <- orthologs$uniq
+orthologs <- orthologs[rownames(logcpm),]
+stopifnot(identical(names(ld.pc2),orthologs$uniq))
+names(ld.pc2) <- orthologs$mouse.entrezgene
+load("../data/meta/mouse_H_v5p2.rdata")
+fgseaRes <- fgsea(Mm.H, 
+                  ld.pc2, 
+                  minSize=15, 
+                  maxSize = 500, 
+                  nperm=1000)
+
+head(fgseaRes[order(padj, -abs(NES)), ], n=10)
+
+plotEnrichment(Mm.H[["HALLMARK_G2M_CHECKPOINT"]], ld.pc2)
+```
