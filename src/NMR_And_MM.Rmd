@@ -32,34 +32,27 @@ theme_set(theme_cowplot())
 # Mouse
 mm.counts <- read.csv("../data/counts/MM_CountMatrix.csv",row.names=1)
 pDat <- read.csv("../data/meta/SampleInfo.csv",stringsAsFactors=FALSE)
-
+pDat_mm <- pDat[pDat$Species=="Mouse",]
+pDat_nmr <- read.csv("../data/meta/NMR_ColData.csv",stringsAsFactor=FALSE)[,-1]
 # NMR
-nmr.counts <- read.csv("../data/counts/NMR_Counts.csv",row.names=1)
+nmr.counts <- read.csv("../data/counts/NMR_Counts_Clean.csv",row.names=1)
 
 # Move stats to PD
-identical(c(colnames(mm.counts),colnames(nmr.counts)),pDat$Sample)
-pDat$Unmapped <- c(t(mm.counts)[,1],t(nmr.counts)[,1])
-pDat$MultiMap <- c(t(mm.counts)[,2],t(nmr.counts)[,2])
-pDat$NoFeat <- c(t(mm.counts)[,3],t(nmr.counts)[,3])
-pDat$Ambiguous <- c(t(mm.counts)[,4],t(nmr.counts)[,4])
+stopifnot(identical(c(colnames(mm.counts)),pDat_mm$Sample))
+pDat_mm$Unmapped <- t(mm.counts)[,1]
+pDat_mm$MultiMap <- t(mm.counts)[,2]
+pDat_mm$NoFeat <- t(mm.counts)[,3]
+pDat_mm$Ambiguous <- t(mm.counts)[,4]
 mm.counts <- mm.counts[-c(1:4),]
-nmr.counts <- nmr.counts[-c(1:4),]
-pDat$TotalReads <- c(colSums(mm.counts),colSums(nmr.counts))
+pDat_mm$TotalReads <- colSums(mm.counts)
+pDat <- rbind(pDat_mm,pDat_nmr)
 ```
 
 
 ## Combining the NMR and MM data
-- For the NMR datadset I need to map the gene0 to entrezIDs because of the gff file
 - I use a published list of orthologs mapping roughly ~16k genes from mouse to nmr (**Hilton et al.**)
 - I then concatenate the two gene expression matrices and use the mouse gene symbols as identifiers
 ```{r, message=FALSE}
-# Convert NMR to Entrez Gene
-# These files will be in the same order as they both derive from the same gtf, but will map them properly anyway
-rmgenes <- read.table("../data/meta/rm_genes.tsv") # These are 24 tRNAs and a few ribosomal RNAs that don't have entrez geneID mapping in the gtf file
-nmr.counts <- nmr.counts[!rownames(nmr.counts) %in% rmgenes$V1,]
-conv <- read.csv("../data/meta/gene_id_mapping_clean.csv",stringsAsFactors=FALSE,row.names=1) # Conv has more genes, some of them were not mapped to in star
-conv <- conv[rownames(nmr.counts),]
-rownames(nmr.counts) <- conv
 
 # Subset both datasets to orthologous genes
 orthologs <- read.csv("../data/meta/media-28.csv",stringsAsFactor=FALSE)
@@ -222,36 +215,4 @@ out[[1]] %+% ggtitle(names(out)[1])
 ggsave("Positive.svg",width=12)
 out[[2]] %+% ggtitle(names(out)[2])
 ggsave("Negative.svg",width=12)
-```
-
-## GSEA 
-- Also did the GSEA but don't like it that much
-```{r, message=FALSE, fig.width=7}
-
-# ---- fgsea ----
-# for the fun of it
-library(fgsea)
-# and get entrez genes
-ensembl  <- useMart("ensembl",dataset="mmusculus_gene_ensembl",host="useast.ensembl.org") # at the time of writing the ensembl.org had issues
-gene.data <- getBM(attributes=c('ensembl_gene_id','entrezgene_id'), mart=ensembl)
-gene.data <- gene.data[gene.data$ensembl_gene_id %in% orthologs$mouse.gene_id,]
-gene.data <- gene.data[!(is.na(gene.data$entrezgene_id)),]
-gene.data <- gene.data[!(duplicated(gene.data$ensembl_gene_id)),]
-gene.data$entrezgene_id <- as.character(gene.data$entrezgene_id)
-colnames(gene.data) <- c("mouse.gene_id","mouse.entrezgene")
-orthologs <- left_join(orthologs,gene.data)
-rownames(orthologs) <- orthologs$uniq
-orthologs <- orthologs[rownames(logcpm),]
-stopifnot(identical(names(ld.pc2),orthologs$uniq))
-names(ld.pc2) <- orthologs$mouse.entrezgene
-load("../data/meta/mouse_H_v5p2.rdata")
-fgseaRes <- fgsea(Mm.H, 
-                  ld.pc2, 
-                  minSize=15, 
-                  maxSize = 500, 
-                  nperm=1000)
-
-head(fgseaRes[order(padj, -abs(NES)), ], n=10)
-
-plotEnrichment(Mm.H[["HALLMARK_G2M_CHECKPOINT"]], ld.pc2)
 ```
